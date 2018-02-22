@@ -9,6 +9,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "int24": "0.0.1"
+    "int24": "0.0.1",
+    "x509": "^0.3.3"
   }
 }

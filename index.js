@@ -1,6 +1,7 @@
 const crypto = require('crypto')
 const net = require('net')
 const int24 = require('int24')
+const x509 = require('x509')
 
 const PROTO_MAJOR_VERSION = 3
 const PROTO_MINOR_VERSION = 3
@@ -23,16 +24,7 @@ const SUPPORTED_CIPHERS = Object.freeze({
 })
 
 const createProtocolVersionBuffer = () => {
-
   return Buffer.from(Uint8Array.from([PROTO_MAJOR_VERSION, PROTO_MINOR_VERSION]).buffer)
-}
-
-const createUInt24Buffer = (number) => {
-  const buf = Buffer.allocUnsafe(3)
-  buf[0] = (number & 0xff0000) >>> 16
-  buf[1] = (number & 0x00ff00) >>> 8
-  buf[2] = number & 0x0000ff
-  return buf
 }
 
 const createRecordLayerBuffer = (contentType, fragment) => {
@@ -41,7 +33,7 @@ const createRecordLayerBuffer = (contentType, fragment) => {
   const header = Buffer.alloc(5)
   header.writeUInt8(contentType, 0) // First byte is contentType
   protocolVersionBuffer.copy(header, 1) // Byte 2-3 - Protocol Version
-  header.writeUInt16BE(fragment.byteLength, 3) // Byte 4-5 - Length of fragment
+  header.writeUInt16BE(fragment.length, 3) // Byte 4-5 - Length of fragment
 
   return Buffer.concat([header, fragment]) // Append fragement
 }
@@ -49,7 +41,7 @@ const createRecordLayerBuffer = (contentType, fragment) => {
 const createHandshake = (handshakeType, body) => {
   const header = Buffer.alloc(4)
   header.writeUInt8(handshakeType, 0) // First byte is handshakeType
-  int24.writeUInt24BE(header, 1, body.byteLength)
+  int24.writeUInt24BE(header, 1, body.length)
   return Buffer.concat([header, body]) // Remaining bytes is the body
 }
 
@@ -60,7 +52,6 @@ const getRandom = () => {
   const unixTimestampSeconds = Math.floor(new Date() / 1000)
   randomBuffer.writeUInt32BE(unixTimestampSeconds, 0) // Bytes 1-4 - Unix timestamp
   randomBytes.copy(randomBuffer, 4) // Bytes 5 - 32 - Random bytes
-  console.log(randomBuffer)
   return randomBuffer
 }
 
@@ -75,11 +66,8 @@ const getCipherSuites = () => {
 
 const getCompressionMethods = () => {
   const compressionMethods = Object.values(COMPRESSION_METHODS)
-  const length = compressionMethods.reduce((total, compressionMethod) => {
-    return total + compressionMethod.byteLength
-  }, 0)
-
-  return Buffer.from(Uint8Array.from([length, ...compressionMethods]))
+  const length = compressionMethods.length
+  return Buffer.from(Uint8Array.from([length, ...compressionMethods]).buffer)
 }
 
 
@@ -100,20 +88,27 @@ const createClientHello = () => {
   ])
 }
 
-//console.log(createHandshake())
-//
 const clientHello = createClientHello()
 const clientHelloHandshake = createHandshake(HANDSHAKE_TYPE.CLIENT_HELLO, clientHello)
 const clientHelloRecordLayer = createRecordLayerBuffer(CONTENT_TYPE.HANDSHAKE, clientHelloHandshake)
 
 var client = new net.Socket();
-client.connect(443, 'www.reddit.com', function() {
+client.connect(443, 'www.google.com', function() {
   console.log('Connected');
   client.write(clientHelloRecordLayer)
 });
 
-client.on('data', function(data) {
+let data = Buffer.alloc(0)
+
+client.on('data', function(newData) {
+  console.log('NEW DATA')
+  data = Buffer.concat([data, newData])
+
   handleRecordLayerStream(data)
+});
+
+client.on('end', function(data) {
+  console.log('END FIRED')
 });
 
 client.on('close', function() {
@@ -129,21 +124,28 @@ const handleRecordLayerStream = (stream) => {
     const fragmentLength = stream.readUInt16BE(3)
     const fragmentStartByte = 5
     const fragmentEndByte = fragmentStartByte + fragmentLength
-    const fragment = stream.slice(fragmentStartByte, fragmentEndByte)
 
-    if (contentType === CONTENT_TYPE.HANDSHAKE) {
-      console.log('HANDSHAKE')
-      handleHandshake(fragment)
-    }
-    else {
-      console.log('UNSUPPORT CONTENT TYPE')
-    }
+    if (fragmentEndByte > stream.length) {
+      console.log('WE DONT HAVE THE FULL FRAGMENT IN THE BUFFER YET, HOLDING FOR MORE DATA')
+      data = stream
+    } else {
+      const fragment = stream.slice(fragmentStartByte, fragmentEndByte)
 
-    if (fragmentEndByte < stream.byteLength) {
-      const remainingStreamStart = fragmentEndByte
-      const remainingStream = stream.slice(remainingStreamStart, stream.byteLength)
-      handleRecordLayerStream(remainingStream)
+      if (contentType === CONTENT_TYPE.HANDSHAKE) {
+        handleHandshake(fragment)
+      }
+      else {
+        console.log('UNSUPPORT CONTENT TYPE')
+      }
+
+      if (fragmentEndByte < stream.length) {
+        const remainingStreamStart = fragmentEndByte
+        const remainingStream = stream.slice(remainingStreamStart)
+        handleRecordLayerStream(remainingStream)
+      }
     }
+  } else {
+    console.log('Invalid data on on buffer')
   }
 }
 
@@ -152,7 +154,7 @@ const handleHandshake = (fragment) => {
   const bodyLength = int24.readUInt24BE(fragment, 1)
   const bodyStartByte = 4
   const bodyEndByte = bodyStartByte + bodyLength
-  const body = fragment.slice(bodyStartByte, bodyEndByte)
+  const body = fragment.slice(bodyStartByte)
 
   if (handshakeType === HANDSHAKE_TYPE.SERVER_HELLO) {
     handleServerHello(body)
@@ -194,6 +196,30 @@ const handleServerHello = (body) => {
 }
 
 const handleCertificate = (body) => {
-  console.log('CERT')
-  console.log(body)
+  const certificatesListLength = int24.readUInt24BE(body, 0)
+  const certificatesList = body.slice(3)
+  const certificates = getCertificatesFromList(certificatesList)
+  console.log(`SERVER SENT ${certificates.length} CERTIFICATES`)
+  certificates.forEach((cert, index) => {
+    const certSubject = x509.getSubject(cert)
+    console.log(`CERT ${index + 1} - Org: ${certSubject.organizationName}, CN: ${certSubject.commonName} `)
+  })
+}
+
+const getCertificatesFromList = (certificatesList) => {
+  const certLength = int24.readUInt24BE(certificatesList, 0)
+  const certStart = 3
+  const certEnd = 3 + certLength
+  const certDER = certificatesList.slice(certStart, certEnd)
+  const certPEM = getPEMCert(certDER)
+  if (certEnd < certificatesList.length) {
+    const remainingCerts = certificatesList.slice(certEnd)
+    return [certPEM, ...getCertificatesFromList(remainingCerts)]
+  }
+
+  return [ certPEM ]
+}
+
+const getPEMCert = (derBuffer) => {
+  return `-----BEGIN CERTIFICATE-----\n${derBuffer.toString('base64').match(/.{0,64}/g).join('\n')}-----END CERTIFICATE-----`
 }
